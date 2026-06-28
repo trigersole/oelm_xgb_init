@@ -1,0 +1,2 @@
+# Railway reads PORT from the environment; uvicorn binds to it.
+web: uvicorn app:app --host 0.0.0.0 --port $PORT
