@@ -6,13 +6,28 @@ single POST /predict endpoint that the browser frontend calls.
 
 import os
 import numpy as np
+import joblib
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from xgboost import XGBClassifier
+import xgboost as xgb
 
 # ── Label configuration ──────────────────────────────────────────
 LABEL_COLS = ["Boredom", "Engagement", "Confusion", "Frustration"]
+
+_THIS_DIR = os.path.dirname(__file__)
+FEATURE_ORDER_CANDIDATES = [
+    os.path.join(_THIS_DIR, "feature_order.pkl"),
+    os.path.join(_THIS_DIR, "..", "feature_order.pkl"),
+]
+
+_feature_order_path = next((p for p in FEATURE_ORDER_CANDIDATES if os.path.exists(p)), None)
+if _feature_order_path is None:
+    raise FileNotFoundError(
+        "feature_order.pkl not found. Expected in railway_api/ or project root."
+    )
+
+FEATURE_ORDER = joblib.load(_feature_order_path)
 
 # Which model files to load (relative to this file).
 # Switch to "model_tuned_{label}.ubj" or "model_{label}.ubj" if preferred.
@@ -22,7 +37,7 @@ MODEL_FILES = {
 }
 
 # ── Load models once at startup ──────────────────────────────────
-models: dict[str, XGBClassifier] = {}
+models: dict[str, xgb.Booster] = {}
 
 def load_models() -> None:
     for label, path in MODEL_FILES.items():
@@ -31,9 +46,9 @@ def load_models() -> None:
                 f"Model file not found: {path}\n"
                 "Copy your .ubj model files into railway_api/models/"
             )
-        clf = XGBClassifier()
-        clf.load_model(path)
-        models[label] = clf
+        booster = xgb.Booster()
+        booster.load_model(path)
+        models[label] = booster
     print(f"[OELM] Loaded {len(models)} models: {list(models)}")
 
 # ── FastAPI app ──────────────────────────────────────────────────
@@ -77,22 +92,33 @@ def predict(body: PredictRequest):
         raise HTTPException(status_code=503, detail="Models not loaded yet")
 
     agg = body.agg_features
+    missing = [k for k in FEATURE_ORDER if k not in agg]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing {len(missing)} features. First 5: {missing[:5]}",
+        )
+
+    x_row = np.array([[agg[k] for k in FEATURE_ORDER]], dtype=np.float32)
+    dmat = xgb.DMatrix(x_row, feature_names=FEATURE_ORDER)
+
     result: dict = {}
 
-    for label, clf in models.items():
-        # Respect the feature order stored inside the booster
-        booster_features = clf.get_booster().feature_names
-        if booster_features:
-            x_row = np.array([[agg.get(f, 0.0) for f in booster_features]], dtype=np.float32)
-        else:
-            x_row = np.array([list(agg.values())], dtype=np.float32)
+    for label, booster in models.items():
+        probs = booster.predict(dmat)
+        if isinstance(probs, np.ndarray) and probs.ndim > 1:
+            probs = probs[0]
+        probs = np.array(probs, dtype=float)
 
-        predicted_class = int(clf.predict(x_row)[0])
-        proba = clf.predict_proba(x_row)[0]   # shape (n_classes,)
+        if probs.ndim == 0:
+            scalar = int(probs.item())
+            probs = np.eye(4)[scalar]
+
+        predicted_class = int(np.argmax(probs))
 
         result[label] = {
             "label": predicted_class,
-            "probabilities": {i: round(float(p), 5) for i, p in enumerate(proba)},
+            "probabilities": {i: round(float(p), 5) for i, p in enumerate(probs)},
         }
 
     return result
